@@ -27,7 +27,6 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-video:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
-    implementation("androidx.camera:camera-extensions:$camerax")
     implementation("androidx.concurrent:concurrent-futures-ktx:1.2.0")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation(platform("androidx.compose:compose-bom:2024.06.00"))

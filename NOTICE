@@ -1,0 +1,5 @@
+PhotonClone
+Manual exposure handling (preview exposure cap, full-length still exposure with a low
+target FPS range, 1/3-stop ISO/shutter steps, MANUAL_SENSOR capability check) is adapted
+from https://github.com/bjzhou/PhotonCamera, licensed under the Apache License 2.0
+(https://www.apache.org/licenses/LICENSE-2.0).
