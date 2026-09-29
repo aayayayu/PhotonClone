@@ -40,7 +40,24 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.concurrent.futures.await
 import androidx.core.content.ContextCompat
+import android.graphics.Bitmap
+import android.graphics.Matrix
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Size
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.security.SecureRandom
+import java.util.concurrent.Executors
 import java.text.SimpleDateFormat
 import java.util.Locale
 import kotlin.math.abs
@@ -69,6 +86,20 @@ private fun nearestT(stops: List<Double>, target: Double): Float {
 private fun shutterLabel(ns: Long): String =
     if (ns < 500_000_000L) "1/${(1e9 / ns).roundToInt()}" else "%.1fs".format(ns / 1e9)
 
+private const val PORT = 8080
+
+private fun localIp(): String? = try {
+    NetworkInterface.getNetworkInterfaces().toList().filter { it.isUp && !it.isLoopback }
+        .flatMap { it.inetAddresses.toList() }
+        .firstOrNull { it is Inet4Address && it.isSiteLocalAddress }?.hostAddress
+} catch (e: Exception) { null }
+
+private fun newKey(): String {
+    val chars = "abcdefghjkmnpqrstuvwxyz23456789"
+    val r = SecureRandom()
+    return (1..8).map { chars[r.nextInt(chars.length)] }.joinToString("")
+}
+
 @OptIn(ExperimentalCamera2Interop::class)
 @Composable
 fun CameraScreen() {
@@ -89,6 +120,21 @@ fun CameraScreen() {
     var isoT by remember { mutableStateOf(0.3f) }
     var shutterT by remember { mutableStateOf(0.5f) }
     var evIndex by remember { mutableStateOf(0f) }
+    var manualFocus by remember { mutableStateOf(false) }
+    var focusT by remember { mutableStateOf(0.2f) }   // 0 = infinity, 1 = closest focus
+    var remoteOn by remember { mutableStateOf(false) }
+    val accessKey = remember { newKey() }
+    val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
+    val imageAnalysis = remember {
+        ImageAnalysis.Builder()
+            .setResolutionSelector(
+                ResolutionSelector.Builder().setResolutionStrategy(
+                    ResolutionStrategy(Size(1280, 720), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
+                ).build()
+            )
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+    }
 
     val imageCapture = remember {
         ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).build()
@@ -137,6 +183,13 @@ fun CameraScreen() {
         } ?: true
     }
 
+    val minFocus: Float = remember(camera) {
+        camera?.let {
+            Camera2CameraInfo.from(it.cameraInfo)
+                .getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+        } ?: 0f
+    }
+
     val isoStops = remember(isoRange) { stopValues(isoRange.lower.toDouble(), isoRange.upper.toDouble()) }
     val expStops = remember(expRange) { stopValues(expRange.lower.toDouble(), expRange.upper.toDouble()) }
     val iso = isoStops[(isoT * (isoStops.size - 1)).roundToInt().coerceIn(0, isoStops.size - 1)].roundToInt()
@@ -144,39 +197,44 @@ fun CameraScreen() {
     val previewCap = if (videoMode) MAX_VIDEO_SHUTTER_NS else MAX_PHOTO_PREVIEW_NS
     val previewLimited = manual && expNs > previewCap
 
-    // Photon-style: repeating preview is capped; the still shot uses the full exposure
-    fun applyManualOptions(cam: Camera, exposureNs: Long, lowFps: Boolean) =
-        Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(
-            CaptureRequestOptions.Builder()
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
-                .setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs)
-                .setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, max(exposureNs, 33_333_333L))
-                .apply {
-                    if (lowFps && lowestFps != null)
-                        setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, lowestFps)
-                }.build()
-        )
+    // Photon-style: repeating preview is capped; the still shot uses the full exposure.
+    // Manual exposure and manual focus are merged into one option set (Camera2 interop).
+    fun buildOptions(exposureNs: Long, lowFps: Boolean): CaptureRequestOptions {
+        val b = CaptureRequestOptions.Builder()
+        if (manual && manualSupported) {
+            b.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+            b.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
+            b.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs)
+            b.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, max(exposureNs, 33_333_333L))
+            if (lowFps && lowestFps != null)
+                b.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, lowestFps)
+        }
+        if (manualFocus && minFocus > 0f) {
+            b.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            b.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusT * minFocus) // diopters
+        }
+        return b.build()
+    }
+    fun applyOptions(cam: Camera, exposureNs: Long, lowFps: Boolean) =
+        Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(buildOptions(exposureNs, lowFps))
 
     // Bind camera when lens or mode changes
-    LaunchedEffect(lensFacing, videoMode) {
+    LaunchedEffect(lensFacing, videoMode, remoteOn) {
         val provider = ProcessCameraProvider.getInstance(context).await()
         val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
         val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
         provider.unbindAll()
-        camera = provider.bindToLifecycle(
-            lifecycleOwner, selector, preview, if (videoMode) videoCapture else imageCapture
-        )
+        val useCases = mutableListOf<UseCase>(preview, if (videoMode) videoCapture else imageCapture)
+        if (remoteOn) useCases += imageAnalysis
+        camera = provider.bindToLifecycle(lifecycleOwner, selector, *useCases.toTypedArray())
         evIndex = 0f
     }
 
-    LaunchedEffect(camera, manual, iso, expNs, videoMode) {
+    LaunchedEffect(camera, manual, manualFocus, iso, expNs, focusT, videoMode) {
         val cam = camera ?: return@LaunchedEffect
-        if (manual && manualSupported) {
-            applyManualOptions(cam, minOf(expNs, previewCap), false)
-        } else {
-            Camera2CameraControl.from(cam.cameraControl).clearCaptureRequestOptions()
-        }
+        val active = (manual && manualSupported) || (manualFocus && minFocus > 0f)
+        if (active) applyOptions(cam, minOf(expNs, previewCap), false)
+        else Camera2CameraControl.from(cam.cameraControl).clearCaptureRequestOptions()
     }
 
     LaunchedEffect(flashOn, camera, videoMode) {
@@ -211,6 +269,69 @@ fun CameraScreen() {
         }
     }
 
+    fun enableMF(on: Boolean) {
+        if (on && minFocus <= 0f) {
+            Toast.makeText(context, "This camera has fixed focus", Toast.LENGTH_SHORT).show()
+            return
+        }
+        manualFocus = on
+    }
+
+    // Commands coming from the laptop (already posted to the main thread)
+    fun applyRemote(q: Map<String, String>) {
+        q["manual"]?.let { enableManual(it == "1") }
+        q["iso"]?.toDoubleOrNull()?.let { isoT = nearestT(isoStops, it); night = false }
+        q["shutter"]?.toDoubleOrNull()?.let { shutterT = nearestT(expStops, it); night = false }
+        q["mf"]?.let { enableMF(it == "1") }
+        q["focus"]?.toFloatOrNull()?.let { if (minFocus > 0f) focusT = (it / minFocus).coerceIn(0f, 1f) }
+    }
+
+    fun stateJson(): String = JSONObject().apply {
+        put("manual", manual); put("manualSupported", manualSupported)
+        put("iso", iso); put("isoStops", JSONArray(isoStops.map { it.roundToInt() }))
+        put("shutterNs", expNs); put("shutterStops", JSONArray(expStops.map { it.toLong() }))
+        put("manualFocus", manualFocus); put("focusMax", minFocus.toDouble())
+        put("focus", (focusT * minFocus).toDouble()); put("video", videoMode)
+    }.toString()
+
+    val latestState = rememberUpdatedState { stateJson() }
+    val latestApply = rememberUpdatedState { q: Map<String, String> ->
+        Handler(Looper.getMainLooper()).post { applyRemote(q) }; Unit
+    }
+
+    DisposableEffect(remoteOn) {
+        if (!remoteOn) return@DisposableEffect onDispose { }
+        val srv = RemoteServer(accessKey, { latestState.value() }, { latestApply.value(it) })
+        try { srv.start(PORT) } catch (e: Exception) {
+            Toast.makeText(context, "Could not start server: ${e.message}", Toast.LENGTH_LONG).show()
+            remoteOn = false
+            return@DisposableEffect onDispose { }
+        }
+        previewView.keepScreenOn = true
+        var lastMs = 0L
+        imageAnalysis.setAnalyzer(analysisExecutor) { img ->
+            try {
+                val now = SystemClock.elapsedRealtime()
+                if (srv.clients > 0 && now - lastMs >= 66) { // ~15 fps, only when someone is watching
+                    lastMs = now
+                    var bmp = img.toBitmap()
+                    val rot = img.imageInfo.rotationDegrees
+                    if (rot != 0) bmp = Bitmap.createBitmap(
+                        bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(rot.toFloat()) }, true
+                    )
+                    val bos = ByteArrayOutputStream()
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 70, bos)
+                    srv.push(bos.toByteArray())
+                }
+            } finally { img.close() }
+        }
+        onDispose {
+            imageAnalysis.clearAnalyzer()
+            srv.stop()
+            previewView.keepScreenOn = false
+        }
+    }
+
     fun takePhoto() {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, "IMG_${stamp()}")
@@ -223,9 +344,9 @@ fun CameraScreen() {
         scope.launch {
             val cam = camera
             val longShot = manual && manualSupported && expNs > previewCap && cam != null
-            if (longShot) applyManualOptions(cam!!, expNs, true).await()
+            if (longShot) applyOptions(cam!!, expNs, true).await()
             val restore = {
-                if (longShot) applyManualOptions(cam!!, minOf(expNs, previewCap), false)
+                if (longShot) applyOptions(cam!!, minOf(expNs, previewCap), false)
             }
             imageCapture.takePicture(opts, ContextCompat.getMainExecutor(context),
                 object : ImageCapture.OnImageSavedCallback {
@@ -269,9 +390,12 @@ fun CameraScreen() {
                 .fillMaxSize()
                 .pointerInput(camera) {
                     detectTapGestures { offset ->
-                        if (!manual) {
+                        if (!manualFocus) {
                             val point = previewView.meteringPointFactory.createPoint(offset.x, offset.y)
-                            camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(point).build())
+                            camera?.cameraControl?.startFocusAndMetering(
+                                (if (manual) FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+                                 else FocusMeteringAction.Builder(point)).build()
+                            )
                         }
                     }
                 }
@@ -286,8 +410,8 @@ fun CameraScreen() {
 
         // Top bar
         Row(
-            Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(12.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            Modifier.align(Alignment.TopCenter).statusBarsPadding().horizontalScroll(rememberScrollState()).padding(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = { flashOn = !flashOn }) {
@@ -295,6 +419,20 @@ fun CameraScreen() {
             }
             FilterChip(selected = manual, onClick = { enableManual(!manual) }, label = { Text("Manual") })
             FilterChip(selected = night, enabled = !videoMode, onClick = { toggleNight() }, label = { Text("Night") })
+            FilterChip(selected = manualFocus, onClick = { enableMF(!manualFocus) }, label = { Text("MF") })
+            FilterChip(selected = remoteOn, onClick = { remoteOn = !remoteOn }, label = { Text("Remote") })
+        }
+
+        if (remoteOn) {
+            val ip = remember(remoteOn) { localIp() }
+            Text(
+                if (ip != null) "On your laptop open:\nhttp://$ip:$PORT/?key=$accessKey"
+                else "No Wi-Fi/hotspot network found - connect first",
+                color = Color.White, style = MaterialTheme.typography.labelLarge,
+                modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(top = 64.dp, start = 12.dp)
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                    .background(Color(0xAA000000)).padding(8.dp)
+            )
         }
 
         // Bottom controls
@@ -302,6 +440,18 @@ fun CameraScreen() {
             Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            if (manualFocus) {
+                val fd = focusT * minFocus
+                Row(
+                    Modifier.fillMaxWidth().padding(bottom = 6.dp)
+                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(16.dp))
+                        .background(Color(0x99000000)).padding(horizontal = 12.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(if (fd < 0.05f) "Focus ∞" else "Focus %.2fm".format(1f / fd), color = Color.White, modifier = Modifier.width(96.dp))
+                    Slider(value = focusT, onValueChange = { focusT = it }, modifier = Modifier.weight(1f))
+                }
+            }
             if (manual) {
                 Column(
                     Modifier.fillMaxWidth().clip(androidx.compose.foundation.shape.RoundedCornerShape(16.dp))
